@@ -1,0 +1,3 @@
+# GUI workbench for the diskinfer Windows port.
+# PySide6 is the only dependency (Qt 6 bindings); nothing else is required.
+PySide6>=6.5

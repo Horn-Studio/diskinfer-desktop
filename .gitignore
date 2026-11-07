@@ -1,0 +1,12 @@
+# build outputs / local artifacts (build\build-windows.ps1 stays tracked)
+/build/win-x64/
+/build/out/
+/build/*.log
+/dist/
+/gui/runs/
+/gui/qa/
+__pycache__/
+*.pyc
+.vs/
+.vscode/
+*.user
