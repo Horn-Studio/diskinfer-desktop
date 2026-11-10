@@ -234,7 +234,9 @@ std::string apply_chat_template(const llama_model * model, const json & messages
 
     std::vector<std::string>        store;
     std::vector<llama_chat_message> cmsgs;
-    store.reserve(messages.size());
+    // Each message contributes a role and a content string. Reserve both up front
+    // so vector growth cannot invalidate the c_str() pointers stored in cmsgs.
+    store.reserve(messages.size() * 2);
     cmsgs.reserve(messages.size());
     for (const auto & m : messages) {
         store.push_back(m.value("role", "user"));
