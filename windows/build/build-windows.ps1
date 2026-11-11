@@ -139,6 +139,11 @@ if (-not $Source) {
         $Source = $env:DISKINFER_SRC
     } else {
         $Source = Join-Path $repoRoot 'src\llama.cpp-fork'
+        # the desktop repo keeps one shared src/ at its root and the Windows tree in windows/
+        if (-not (Test-Path -LiteralPath (Join-Path $Source 'src\llama-disk.cpp'))) {
+            $shared = Join-Path (Split-Path -Parent $repoRoot) 'src\llama.cpp-fork'
+            if (Test-Path -LiteralPath (Join-Path $shared 'src\llama-disk.cpp')) { $Source = $shared }
+        }
     }
 }
 if (-not $BuildDir) { $BuildDir = Join-Path $here 'win-x64' }

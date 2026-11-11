@@ -97,6 +97,10 @@ $exeNames = @('disktui.exe', 'diskrun.exe', 'diskc.exe', 'llama-completion.exe')
 $pkgName  = "diskinfer-windows-$Version-win-x64"
 $stage    = Join-Path $Root 'build\pkg-stage'
 $srcTree  = Join-Path $Root 'src\llama.cpp-fork'
+if (-not (Test-Path -LiteralPath (Join-Path $srcTree 'src\llama-disk.cpp'))) {
+    $shared = Join-Path (Split-Path -Parent $Root) 'src\llama.cpp-fork'
+    if (Test-Path -LiteralPath (Join-Path $shared 'src\llama-disk.cpp')) { $srcTree = $shared }
+}
 
 Write-Host "package : $pkgName"
 Write-Host "root    : $Root"

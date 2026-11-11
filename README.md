@@ -19,14 +19,14 @@ Releases → **「1.0.1 Windows/Linux」**：
 ## 目录
 
 - `src/llama.cpp-fork/`：三端共用的 llama.cpp fork 源码（v0.9.0 + diskinfer 补丁）
-- Windows：`build/build-windows.ps1`、`device/`、`gui/`、`test/`，详见 [windows-README.md](windows-README.md)
+- Windows：`windows/build/build-windows.ps1`、`windows/device/`、`windows/gui/`、`windows/test/`，详见 [windows/README.md](windows/README.md)
 - Linux：`linux/`（`build/`、`device/`、`gui/`、`test/`、`install.sh`），详见 [linux/README.md](linux/README.md)
 
 ## 构建
 
 ```powershell
 # Windows x64（VS2022 + CMake）
-pwsh -File build\build-windows.ps1
+pwsh -File windows\build\build-windows.ps1
 ```
 
 ```bash
