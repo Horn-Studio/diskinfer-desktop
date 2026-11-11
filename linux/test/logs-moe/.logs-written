@@ -1,0 +1,14 @@
+test/logs-moe/case1-streaming-200.log
+test/logs-moe/case2-native-baseline.log
+test/logs-moe/case3-auto-arena.log
+test/logs-moe/case4-odirect-off.log
+test/logs-moe/case5-disktui-oneshot.log
+test/logs-moe/case6-error-missing-model.log
+test/logs-moe/case7-tiny-arena-32.log
+test/logs-moe/case8-diskc-json.log
+test/logs-moe/case9-gui-offscreen.log
+test/logs-moe/case10-tui-en.log
+test/logs-moe/case10-tui-zh-Hans.log
+test/logs-moe/case10-tui-zh-Hant.log
+test/logs-moe/case10-tui-env.log
+test/logs-moe/case11-tui-api.log

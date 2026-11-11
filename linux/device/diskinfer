@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+# diskinfer Linux launcher for disktui (the diskinfer TUI).
+#
+# Linux counterpart of device/diskinfer.ps1 of the Windows port:
+# finds a model, picks a sensible arena size, sets the disk-streaming log
+# location, and execs disktui with the arguments passed through untouched.
+#
+#   diskinfer                                  interactive, model auto-detected
+#   diskinfer "The capital of France is"       one-shot question
+#   diskinfer -m ~/models/qwen.gguf --arena 1024 -n 64 "hello"
+#   diskinfer -l                               list the models found
+#   diskinfer -h                               full help
+#
+# Bare words (not starting with '-') are joined with spaces and become the
+# one-shot question. Everything else after the known options is forwarded to
+# disktui as-is.
+#
+# messages: en / zh-Hans / zh-Hant, auto-detected (contract v5 §1.3):
+#   --lang CLI > DISKINFER_LANG > $LC_ALL > $LC_MESSAGES > $LANG > /etc/default/locale > en
+
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+# follow symlinks so the launcher can be linked into ~/.local/bin
+while [ -L "$SELF" ]; do
+    target="$(readlink -f -- "$SELF")"
+    SELF="$target"
+done
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SELF")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+
+# ---------------------------------------------------------------------------
+# i18n
+# ---------------------------------------------------------------------------
+lang_from_tag() {
+    local tag
+    tag="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+    case "$tag" in
+        *hant*|*tw*|*hk*|*mo*) printf '%s' zh-hant ;;
+        zh*)                   printf '%s' zh-hans ;;
+        *)                     printf '%s' en ;;
+    esac
+}
+
+probe_system_lang() {
+    local probe
+    probe="${LC_ALL:-}"
+    [ -z "$probe" ] && probe="${LC_MESSAGES:-}"
+    [ -z "$probe" ] && probe="${LANG:-}"
+    if [ -z "$probe" ] && [ -r /etc/default/locale ]; then
+        probe="$(grep '^LANG=' /etc/default/locale 2>/dev/null | head -1 | sed 's/^LANG=//; s/^"//; s/"$//' || true)"
+    fi
+    printf '%s' "$probe"
+}
+
+detect_lang() {
+    local explicit="${1:-}"
+    if [ -z "$explicit" ] && [ -n "${DISKINFER_LANG:-}" ]; then
+        explicit="$DISKINFER_LANG"
+    fi
+    if [ -z "$explicit" ]; then
+        explicit="$(probe_system_lang)"
+    fi
+    lang_from_tag "$explicit"
+}
+
+# t <en> <zh-Hans> <zh-Hant>
+t() {
+    case "$L10N" in
+        zh-hans) printf '%s' "$2" ;;
+        zh-hant) printf '%s' "$3" ;;
+        *)       printf '%s' "$1" ;;
+    esac
+}
+
+# scan argv for --lang TAG / --lang=TAG: the launcher resolves it and exports the
+# result as DISKINFER_LANG, which the new TUI (and the engine) also reads.
+scan_lang_arg() {
+    local prev="" a
+    for a in "$@"; do
+        case "$prev" in
+            --lang) printf '%s' "$a"; return 0 ;;
+        esac
+        case "$a" in
+            --lang=*) printf '%s' "${a#*=}"; return 0 ;;
+        esac
+        prev="$a"
+    done
+    return 1
+}
+
+usage() {
+    case "$L10N" in
+        zh-hans)
+            cat <<'EOF'
+用法: diskinfer [问题词...]
+      diskinfer -m PATH [--arena MiB] [问题词...] [引擎参数]
+
+  -m PATH        模型文件（.gguf）。省略时会搜索唯一一个 *.gguf：
+                 ~/models、./models、~/Downloads/models
+                 （多个模型 -> 退出码 2，一个都没有 -> 退出码 1）
+  --arena MiB    权重 arena 大小（设置 LLAMA_DISK_STREAM_MB；引擎会把它抬到
+                 能装下最大张量，上限 2048 MiB）
+                 默认 = 内存总量 / 8，收窄到 176..2048 MiB
+  --lang TAG     界面语言（启动器与 TUI，经 DISKINFER_LANG 传给引擎）:
+                 auto / en / zh-Hans / zh-Hant（默认按系统）
+  -n N           最多生成 token 数（默认 256，受上下文限制）
+  -c N           上下文大小（默认 256）
+  -ub N          prefill 批大小（默认 4；1 = 最省内存，prefill 最慢）
+  -t N           线程数（默认 4，桌面可试 8-16）
+  --temp F       采样温度（默认 1.0）
+  --top-k N      默认 20
+  --top-p F      默认 0.95
+  --raw          原始补全模式（默认）
+  --chat         使用聊天模板（关闭 thinking）
+  --sys "text"   --chat 的 system 消息
+  --debug        磁盘流式诊断日志（LLAMA_DISK_DEBUG=1）
+  --moe          启动时开启 MoE 专家快速路径（LLAMA_DISK_MOE=1）
+  --api          启动时开启 4000 端口 OpenAI 兼容 API（同进程）
+  --api-only     不开 TUI，只跑 API 服务（无需终端，适合后台/服务器）
+  --port N       API 端口（默认 4000）
+  -l, --list     列出搜索目录里找到的模型并退出
+  -h, --help     显示本帮助并退出
+
+环境变量:
+  LLAMA_DISK_LOG       默认: $XDG_STATE_HOME/diskinfer/diskinfer.log
+                       （~/.local/state/diskinfer/diskinfer.log）或 /tmp
+  LLAMA_DISK_STREAM_MB arena 大小 MiB（--arena 会覆盖它）
+  DISKINFER_DISKTUI    显式指定 disktui 路径（测试旁路构建用）
+  DISKINFER_MODEL_DIRS 额外的模型搜索目录，冒号分隔
+  DISKINFER_LANG       界面语言，覆盖系统语言（en / zh-Hans / zh-Hant）
+
+示例:
+  diskinfer "The capital of France is"
+  diskinfer -m ~/models/qwen.gguf --arena 1024 -n 64 --chat "hello"
+
+模型搜索顺序:
+  $DISKINFER_MODEL_DIRS（如果设置了）
+  ~/models/*.gguf
+  ./models/*.gguf
+  ~/Downloads/models/*.gguf
+EOF
+            ;;
+        zh-hant)
+            cat <<'EOF'
+用法: diskinfer [問題詞...]
+      diskinfer -m PATH [--arena MiB] [問題詞...] [引擎參數]
+
+  -m PATH        模型檔（.gguf）。省略時會搜尋唯一一個 *.gguf：
+                 ~/models、./models、~/Downloads/models
+                 （多個模型 -> 結束碼 2，一個都沒有 -> 結束碼 1）
+  --arena MiB    權重 arena 大小（設定 LLAMA_DISK_STREAM_MB；引擎會把它抬到
+                 能裝下最大張量，上限 2048 MiB）
+                 預設 = 記憶體總量 / 8，收窄到 176..2048 MiB
+  --lang TAG     介面語言（啟動器與 TUI，經 DISKINFER_LANG 傳給引擎）:
+                 auto / en / zh-Hans / zh-Hant（預設依系統）
+  -n N           最多產生 token 數（預設 256，受上下文限制）
+  -c N           上下文大小（預設 256）
+  -ub N          prefill 批大小（預設 4；1 = 最省記憶體，prefill 最慢）
+  -t N           執行緒數（預設 4，桌機可試 8-16）
+  --temp F       取樣溫度（預設 1.0）
+  --top-k N      預設 20
+  --top-p F      預設 0.95
+  --raw          原始補全模式（預設）
+  --chat         使用聊天模板（關閉 thinking）
+  --sys "text"   --chat 的 system 訊息
+  --debug        磁碟串流診斷日誌（LLAMA_DISK_DEBUG=1）
+  --moe          啟動時開啟 MoE 專家快速路徑（LLAMA_DISK_MOE=1）
+  --api          啟動時開啟 4000 埠 OpenAI 相容 API（同處理程序）
+  --api-only     不開 TUI，只跑 API 服務（無需終端，適合背景/伺服器）
+  --port N       API 埠（預設 4000）
+  -l, --list     列出搜尋目錄裡找到的模型並離開
+  -h, --help     顯示本說明並離開
+
+環境變數:
+  LLAMA_DISK_LOG       預設: $XDG_STATE_HOME/diskinfer/diskinfer.log
+                       （~/.local/state/diskinfer/diskinfer.log）或 /tmp
+  LLAMA_DISK_STREAM_MB arena 大小 MiB（--arena 會覆蓋它）
+  DISKINFER_DISKTUI    明確指定 disktui 路徑（測試旁路建置用）
+  DISKINFER_MODEL_DIRS 額外的模型搜尋目錄，冒號分隔
+  DISKINFER_LANG       介面語言，覆蓋系統語言（en / zh-Hans / zh-Hant）
+
+範例:
+  diskinfer "The capital of France is"
+  diskinfer -m ~/models/qwen.gguf --arena 1024 -n 64 --chat "hello"
+
+模型搜尋順序:
+  $DISKINFER_MODEL_DIRS（如果有設定）
+  ~/models/*.gguf
+  ./models/*.gguf
+  ~/Downloads/models/*.gguf
+EOF
+            ;;
+        *)
+            cat <<'EOF'
+usage: diskinfer [question words...]
+       diskinfer -m PATH [--arena MiB] [question words...] [engine args]
+
+  -m PATH        model file (.gguf). if omitted, exactly one *.gguf is searched
+                 for in: ~/models, ./models, ~/Downloads/models (several models
+                 -> exit 2, none -> exit 1)
+  --arena MiB    weight arena size (sets LLAMA_DISK_STREAM_MB; the engine raises
+                 it to fit the largest tensor and caps it at 2048 MiB)
+                 default = total RAM / 8, clamped to 176..2048 MiB
+  --lang TAG     UI language for the launcher and the TUI (exported to the
+                 engine as DISKINFER_LANG): auto / en / zh-Hans / zh-Hant
+  -n N           max tokens to generate (default 256, capped by ctx)
+  -c N           context size (default 256)
+  -ub N          prefill batch (default 4; 1 = least RAM, slowest prefill)
+  -t N           threads (default 4, try 8-16 on a desktop)
+  --temp F       sampling temperature (default 1.0)
+  --top-k N      default 20
+  --top-p F      default 0.95
+  --raw          raw completion prompt (default)
+  --chat         use the chat template with thinking off
+  --sys "text"   system message for --chat
+  --debug        verbose disk-streaming diagnostics (LLAMA_DISK_DEBUG=1)
+  --moe          start with the MoE expert fast path enabled (LLAMA_DISK_MOE=1)
+  --api          start with the in-process OpenAI-compatible API on port 4000
+  --api-only     no TUI, API server only (headless: servers / background)
+  --port N       API port (default 4000)
+  -l, --list     list the models found in the search dirs and exit
+  -h, --help     show this help and exit
+
+environment:
+  LLAMA_DISK_LOG       default: $XDG_STATE_HOME/diskinfer/diskinfer.log
+                       (~/.local/state/diskinfer/diskinfer.log) or /tmp
+  LLAMA_DISK_STREAM_MB arena size in MiB (--arena overrides it)
+  DISKINFER_DISKTUI    explicit path to the disktui binary (for testing side builds)
+  DISKINFER_MODEL_DIRS extra model search dirs, colon separated
+  DISKINFER_LANG       UI language override (en / zh-Hans / zh-Hant)
+
+examples:
+  diskinfer "The capital of France is"
+  diskinfer -m ~/models/qwen.gguf --arena 1024 -n 64 --chat "hello"
+
+model search order:
+  $DISKINFER_MODEL_DIRS (if set)
+  ~/models/*.gguf
+  ./models/*.gguf
+  ~/Downloads/models/*.gguf
+EOF
+            ;;
+    esac
+}
+
+warn() { printf 'diskinfer: %s\n' "$*" >&2; }
+
+search_dirs() {
+    local dir
+    if [ -n "${DISKINFER_MODEL_DIRS:-}" ]; then
+        local IFS=':'
+        for dir in $DISKINFER_MODEL_DIRS; do
+            [ -n "$dir" ] && printf '%s\n' "${dir/#\~/$HOME}"
+        done
+    fi
+    printf '%s\n' "$HOME/models"
+    printf '%s\n' "$(pwd)/models"
+    printf '%s\n' "$HOME/Downloads/models"
+}
+
+find_models() { # print every *.gguf in the search dirs, sorted
+    local dir
+    while IFS= read -r dir; do
+        [ -d "$dir" ] || continue
+        find -L "$dir" -maxdepth 1 -type f -name '*.gguf' -print 2>/dev/null | LC_ALL=C sort
+    done < <(search_dirs)
+}
+
+total_ram_mib() {
+    if [ -r /proc/meminfo ]; then
+        awk '/^MemTotal:/ { printf "%d", $2 / 1024; exit }' /proc/meminfo
+    else
+        # portable fallback for non-Linux (BSD/macOS): sysctl
+        local bytes
+        bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
+        echo $(( bytes / 1048576 ))
+    fi
+}
+
+default_arena_mib() {
+    local total arena
+    total="$(total_ram_mib)"
+    [ "$total" -gt 0 ] 2>/dev/null || { echo 0; return; }
+    arena=$(( total / 8 ))
+    [ "$arena" -lt 176 ] && arena=176
+    [ "$arena" -gt 2048 ] && arena=2048
+    echo "$arena"
+}
+
+find_disktui() {
+    local candidate
+    for candidate in \
+        "${DISKINFER_DISKTUI:-}" \
+        "$SCRIPT_DIR/disktui" \
+        "$REPO_ROOT/bin/disktui" \
+        "$REPO_ROOT/build/out/linux-x64/disktui" \
+        "$REPO_ROOT/build/build-linux/bin/llama-diskui" \
+        "$REPO_ROOT/build/out/linux-x64/llama-diskui" \
+        "$REPO_ROOT/src/llama.cpp-fork/build/bin/llama-diskui"
+    do
+        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# language: CLI --lang > DISKINFER_LANG > system
+# ---------------------------------------------------------------------------
+LANG_CLI=""
+LANG_CLI="$(scan_lang_arg "$@" || true)"
+L10N="$(detect_lang "$LANG_CLI")"
+# the new TUI reads the same env var, so launcher and engine agree on the language
+export DISKINFER_LANG="$L10N"
+
+# ---------------------------------------------------------------------------
+# parse arguments (same shape as the Windows launcher)
+# ---------------------------------------------------------------------------
+model_path=""
+arena_mib=0
+arena_given=0
+end_of_options=0
+question=()
+child_args=()
+
+value_options=(-n -c -ub -b -t -ngl --temp --top-k --top-p -q --sys --prompt --port --api-ctx)
+flag_options=(--raw --chat --debug --moe --api --api-only)
+
+while [ $# -gt 0 ]; do
+    a="$1"
+    next="${2:-}"
+    if [ "$end_of_options" = "1" ]; then
+        question+=("$a"); shift; continue
+    fi
+    case "$a" in
+        --) end_of_options=1; shift; continue ;;
+        -h|--help|-help|-\?) usage; exit 0 ;;
+        --lang)  shift 2; continue ;;
+        --lang=*) shift; continue ;;
+        -l|--list|-list)
+            models=()
+            while IFS= read -r m; do [ -n "$m" ] && models+=("$m"); done < <(find_models)
+            echo "$(t 'model search dirs:' '模型搜索目录:' '模型搜尋目錄:')"
+            while IFS= read -r dir; do
+                if [ -d "$dir" ]; then state="$(t 'exists' '存在' '存在')"; else state="$(t 'missing' '不存在' '不存在')"; fi
+                printf '  %s  [%s]\n' "$dir" "$state"
+            done < <(search_dirs)
+            if [ "${#models[@]}" -eq 0 ]; then
+                echo "$(t 'no *.gguf model found' '没有找到 *.gguf 模型' '沒有找到 *.gguf 模型')"
+                exit 1
+            fi
+            echo
+            for m in "${models[@]}"; do
+                bytes=$(stat -c '%s' "$m" 2>/dev/null || echo 0)
+                printf '  %10.1f MiB  %s\n' "$(awk -v b="$bytes" 'BEGIN { print b/1048576 }')" "$m"
+            done
+            exit 0 ;;
+        -m|--model)
+            [ -n "$next" ] || { warn "$(t '-m needs a model path' '-m 需要一个模型路径' '-m 需要一個模型路徑')"; exit 2; }
+            model_path="$next"; shift 2; continue ;;
+        --arena=*)
+            text="${a#*=}"
+            case "$text" in ''|*[!0-9]*) warn "$(t "--arena needs a positive number in MiB (got '$text')" "--arena 需要一个正整数（MiB，收到 '$text'）" "--arena 需要一個正整數（MiB，收到 '$text'）")"; exit 2 ;; esac
+            [ "$text" -ge 1 ] 2>/dev/null || { warn "$(t "--arena needs a positive number in MiB (got '$text')" "--arena 需要一个正整数（MiB，收到 '$text'）" "--arena 需要一個正整數（MiB，收到 '$text'）")"; exit 2; }
+            arena_mib="$text"; arena_given=1; shift; continue ;;
+        --arena)
+            [ -n "$next" ] || { warn "$(t '--arena needs a number in MiB' '--arena 需要一个数字（MiB）' '--arena 需要一個數字（MiB）')"; exit 2; }
+            case "$next" in ''|*[!0-9]*) warn "$(t "--arena needs a positive number in MiB (got '$next')" "--arena 需要一个正整数（MiB，收到 '$next'）" "--arena 需要一個正整數（MiB，收到 '$next'）")"; exit 2 ;; esac
+            [ "$next" -ge 1 ] 2>/dev/null || { warn "$(t "--arena needs a positive number in MiB (got '$next')" "--arena 需要一个正整数（MiB，收到 '$next'）" "--arena 需要一個正整數（MiB，收到 '$next'）")"; exit 2; }
+            arena_mib="$next"; arena_given=1; shift 2; continue ;;
+    esac
+    matched=0
+    for opt in "${value_options[@]}"; do
+        if [ "$a" = "$opt" ]; then
+            child_args+=("$a")
+            if [ -n "$next" ]; then child_args+=("$next"); shift 2; else shift; fi
+            matched=1; break
+        fi
+    done
+    [ "$matched" = "1" ] && continue
+    for opt in "${flag_options[@]}"; do
+        if [ "$a" = "$opt" ]; then child_args+=("$a"); shift; matched=1; break; fi
+    done
+    [ "$matched" = "1" ] && continue
+    case "$a" in
+        -*) child_args+=("$a"); shift; continue ;;
+        *)  question+=("$a"); shift; continue ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# resolve the model
+# ---------------------------------------------------------------------------
+if [ -z "$model_path" ]; then
+    models=()
+    while IFS= read -r m; do [ -n "$m" ] && models+=("$m"); done < <(find_models)
+    if [ "${#models[@]}" -eq 1 ]; then
+        model_path="${models[0]}"
+    elif [ "${#models[@]}" -eq 0 ]; then
+        echo "$(t 'diskinfer: no .gguf model found' 'diskinfer: 没有找到 .gguf 模型' 'diskinfer: 沒有找到 .gguf 模型')"
+        echo "$(t 'searched:' '搜索过:' '搜尋過:')"
+        while IFS= read -r dir; do
+            if [ -d "$dir" ]; then state="$(t 'no *.gguf inside' '目录里没有 *.gguf' '目錄裡沒有 *.gguf')"; else state="$(t 'missing' '不存在' '不存在')"; fi
+            printf '  %s  [%s]\n' "$dir" "$state"
+        done < <(search_dirs)
+        echo
+        echo "$(t 'put a .gguf model in one of those dirs, or pass -m PATH' '把 .gguf 模型放进上面任一目录，或者用 -m PATH 指定' '把 .gguf 模型放進上面任一目錄，或者用 -m PATH 指定')"
+        exit 1
+    else
+        printf '%s\n' "$(t "diskinfer: found ${#models[@]} .gguf models, pass -m PATH to choose one:" "diskinfer: 找到 ${#models[@]} 个 .gguf 模型，用 -m PATH 选一个:" "diskinfer: 找到 ${#models[@]} 個 .gguf 模型，用 -m PATH 選一個:")"
+        printf '  %s\n' "${models[@]}"
+        exit 2
+    fi
+else
+    [ -f "$model_path" ] || { warn "$(t "model not found: $model_path" "模型不存在: $model_path" "模型不存在: $model_path")"; exit 1; }
+    model_path="$(cd -- "$(dirname -- "$model_path")" && pwd)/$(basename -- "$model_path")"
+fi
+
+# ---------------------------------------------------------------------------
+# locate disktui
+# ---------------------------------------------------------------------------
+disktui="$(find_disktui || true)"
+if [ -z "$disktui" ]; then
+    echo "$(t 'diskinfer: disktui not found. looked for:' 'diskinfer: 没有找到 disktui。找过:' 'diskinfer: 沒有找到 disktui。找過:')"
+    [ -n "${DISKINFER_DISKTUI:-}" ] && printf '  %s  (DISKINFER_DISKTUI)\n' "$DISKINFER_DISKTUI"
+    printf '  %s\n' "$SCRIPT_DIR/disktui" "$REPO_ROOT/bin/disktui" \
+        "$REPO_ROOT/build/out/linux-x64/disktui" "$REPO_ROOT/build/build-linux/bin/llama-diskui"
+    echo
+    echo "$(t 'build it first:' '请先构建:' '請先建置:')"
+    echo "  $REPO_ROOT/build/build-linux.sh"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# environment defaults
+# ---------------------------------------------------------------------------
+if [ "$arena_given" = "0" ]; then
+    arena_mib="$(default_arena_mib)"
+fi
+if [ "$arena_mib" -gt 0 ]; then
+    # the disk engine reads the arena size from LLAMA_DISK_STREAM_MB; we do not
+    # pass --arena to disktui because older builds would treat the number as the
+    # question text
+    export LLAMA_DISK_STREAM_MB="$arena_mib"
+fi
+
+if [ -z "${LLAMA_DISK_LOG:-}" ]; then
+    state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/diskinfer"
+    if mkdir -p "$state_dir" 2>/dev/null; then
+        export LLAMA_DISK_LOG="$state_dir/diskinfer.log"
+    else
+        export LLAMA_DISK_LOG="${TMPDIR:-/tmp}/diskinfer.log"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# run
+# ---------------------------------------------------------------------------
+run_args=(-m "$model_path")
+if [ "${#child_args[@]}" -gt 0 ]; then run_args+=("${child_args[@]}"); fi
+if [ "${#question[@]}" -gt 0 ]; then
+    joined=""
+    for word in "${question[@]}"; do
+        if [ -n "$joined" ]; then joined="$joined $word"; else joined="$word"; fi
+    done
+    run_args+=("$joined")
+fi
+
+echo "$(t "diskinfer: model $model_path" "diskinfer: 模型 $model_path" "diskinfer: 模型 $model_path")"
+[ "$arena_mib" -gt 0 ] && echo "$(t "diskinfer: arena $arena_mib MiB" "diskinfer: arena $arena_mib MiB" "diskinfer: arena $arena_mib MiB")"
+echo "$(t "diskinfer: log $LLAMA_DISK_LOG" "diskinfer: 日志 $LLAMA_DISK_LOG" "diskinfer: 日誌 $LLAMA_DISK_LOG")"
+echo "$(t "diskinfer: exec $disktui" "diskinfer: 执行 $disktui" "diskinfer: 執行 $disktui")"
+exec "$disktui" "${run_args[@]}"

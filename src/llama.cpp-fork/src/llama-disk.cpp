@@ -215,6 +215,24 @@ struct fd_info {
     size_t fsize  = 0;
 };
 
+// MoE fast path: a MUL_MAT_ID weight tensor is streamed as one compact block holding only
+// the expert slices selected by the router, next to a copy of the ids renumbered to the
+// compact slots. The block lives in the arena and is freed when the last thread is done.
+enum : int {
+    MOE_WIN_LOADING = 0, // the elected thread is reading the slices
+    MOE_WIN_READY   = 1, // published, src[0]/src[2] point into it
+};
+
+struct moe_window {
+    ggml_tensor *         w        = nullptr;
+    ggml_tensor *         ids      = nullptr;
+    int64_t               slot     = -1;
+    int                   state    = MOE_WIN_LOADING;
+    int64_t               ne2      = 0;       // saved ne[2] (number of experts)
+    uint8_t *             w_data   = nullptr; // saved data pointers
+    uint8_t *             ids_data = nullptr;
+};
+
 static uint8_t g_dummy[64];
 
 struct state {
@@ -223,7 +241,11 @@ struct state {
     bool     odirect  = false;
     bool     prefetch = true;
     bool     window = false;   // experimental: row/view windows
+    bool     window_rows  = true;  // GET_ROWS row windows
+    bool     window_dbg   = false; // LLAMA_DISK_WINDOW_DEBUG=1
+    bool     window_views = true;  // view windows
     bool     verbose = false;  // periodic counter dumps
+    bool     moe     = false;  // experimental: only the selected experts are streamed
     size_t   align_io = ALIGN;
     size_t   lookahead = 16;
     size_t   arena_size = 0;
@@ -237,6 +259,14 @@ struct state {
     std::vector<arena_slot> slots;
     std::unordered_map<ggml_tensor *, disk_tensor> tensors;
     std::unordered_map<ggml_tensor *, int64_t> windows; // transient residency of a view of a disk tensor
+    std::unordered_map<ggml_tensor *, uint8_t *> window_saved; // data pointer the window overwrote
+    // windows whose pins dropped to zero: freed at the start of the next node, after every
+    // compute thread has passed the node barrier (some ops are executed by thread 0 only, so
+    // the last unpin can happen while the other threads are still waiting for the window)
+    std::vector<ggml_tensor *> windows_defer;
+    struct window_restore { ggml_tensor * ids = nullptr; std::vector<int32_t> orig; };
+    std::unordered_map<ggml_tensor *, window_restore> window_restore_map; // compact rows: ids to put back
+    std::unordered_map<ggml_tensor *, moe_window> moe_windows; // compact expert blocks, one per weight tensor
     std::vector<ggml_tensor *> order; // tensors sorted by file offset, drives the prefetch
 
     std::vector<fd_info> fds;
@@ -268,7 +298,16 @@ struct state {
     uint64_t bytes_loaded     = 0;
     uint64_t bytes_evicted    = 0;
 
+    // MoE fast path counters
+    uint64_t n_moe_nodes    = 0; // MUL_MAT_ID nodes served from a compact expert block
+    uint64_t n_moe_experts  = 0; // expert slices read in, deduplicated per node
+    uint64_t n_moe_bytes    = 0; // bytes read for those slices
+    uint64_t n_moe_fallback = 0; // nodes that had to use the whole-tensor load
+
     size_t max_tensor = 0;
+    size_t max_row_bytes = 0;   // widest row among the registered tensors (chunk sizing)
+    int    auto_chunk_rows = 0; // row chunk picked to fit ~1/5 of a tiny arena
+    bool   tiny = false;        // arena smaller than the largest tensor: read big tensors in chunks
     int    cur_layer = -1;
     int    n_layer   = -1;
     std::string name_max;
@@ -287,6 +326,19 @@ void (*g_msg_cb)(const char *) = nullptr;
 // slot index of the calling thread for diagnostics
 thread_local int tls_slot = -1;
 thread_local bool tls_slot_set = false;
+
+// MoE fast path: the compact expert window this compute thread pinned for the node it is
+// about to run (the node callbacks are strictly nested per thread: false ... true)
+thread_local ggml_tensor * tls_moe_w    = nullptr;
+thread_local bool          tls_moe_used = false;
+
+// GET_ROWS rows window: the tensor this compute thread pinned through ensure_rows_window()
+// (that window is pinned exactly once here, so the generic src loop must not pin it again)
+thread_local ggml_tensor * tls_rows_w   = nullptr;
+thread_local ggml_tensor * tls_cur_node = nullptr; // node being prepared by this thread
+thread_local std::vector<int32_t> tls_moe_ids;   // ids as read from the router
+thread_local std::vector<int32_t> tls_moe_sel;   // deduplicated expert ids
+thread_local std::vector<int32_t> tls_moe_remap; // original id -> compact slot
 
 void diag_set(const char * name, int what) {
     if (!tls_slot_set) {
@@ -569,8 +621,10 @@ bool load_into(std::unique_lock<std::mutex> & lk, ggml_tensor * t, disk_tensor &
 
     if (g.need > S.arena_size) {
         dmsg("llama-disk: tensor '%s' needs %zu MiB but the arena is only %zu MiB, "
-                        "restart with a bigger LLAMA_DISK_STREAM_MB\n",
-                ggml_get_name(t), g.need >> 20, S.arena_size >> 20);
+                        "restart with a bigger LLAMA_DISK_STREAM_MB (node %s op %s)\n",
+                ggml_get_name(t), g.need >> 20, S.arena_size >> 20,
+                tls_cur_node ? ggml_get_name(tls_cur_node) : "?",
+                tls_cur_node ? ggml_op_name(tls_cur_node->op) : "?");
         S.fail    = true;
         dt.state  = ST_ABSENT;
         S.cv_done.notify_all();
@@ -720,6 +774,10 @@ void ensure_locked(std::unique_lock<std::mutex> & lk, ggml_tensor * t) {
     }
 
     disk_tensor & dt = it->second;
+    if (S.window_dbg && dt.state != ST_RESIDENT) {
+        fprintf(stderr, "llama-disk[win]: full load %s off=%zu size=%zu MiB state=%d\n",
+                ggml_get_name(t), dt.off, dt.size >> 20, (int) dt.state);
+    }
 
     if (dt.state != ST_RESIDENT) {
         if (dt.state == ST_LOADING) {
@@ -763,15 +821,138 @@ void unpin(ggml_tensor * t) {
     }
 }
 
+// prefill GET_ROWS: the ids of a whole ubatch are scattered over the vocab, so the span trick
+// would read almost the whole table. gather only the unique rows into a compact block, remap the
+// ids in place (restored when the window is finally released) and point the weight at the block.
+bool ensure_rows_compact(std::unique_lock<std::mutex> & lk, ggml_tensor * node) {
+    ggml_tensor * w  = node->src[0];
+    ggml_tensor * ix = node->src[1];
+    auto it = S.tensors.find(w);
+    if (it == S.tensors.end() || ix == nullptr || ix->data == nullptr || ix->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (S.windows.count(w) > 0) {
+        return false;
+    }
+
+    const int64_t n = ggml_nelements(ix);
+    const size_t  row_bytes = w->nb[1];
+    if (n < 1 || n > 512) {
+        return false;
+    }
+
+    const int32_t * ids = (const int32_t *) ix->data;
+    std::vector<int32_t> uniq;
+    uniq.reserve((size_t) n);
+    std::vector<int32_t> remap((size_t) n, -1);
+    for (int64_t i = 0; i < n; ++i) {
+        if (ids[i] < 0 || ids[i] >= w->ne[1]) {
+            return false;
+        }
+        int32_t slot = -1;
+        for (size_t j = 0; j < uniq.size(); ++j) {
+            if (uniq[j] == ids[i]) {
+                slot = (int32_t) j;
+                break;
+            }
+        }
+        if (slot < 0) {
+            slot = (int32_t) uniq.size();
+            uniq.push_back(ids[i]);
+        }
+        remap[(size_t) i] = slot;
+    }
+
+    const size_t total = uniq.size() * row_bytes;
+    if (total > S.arena_size / 2) {
+        return false;
+    }
+
+    const disk_tensor & wdt = it->second;
+
+    // claim + allocate a compact block (same policy as load_into: evict or wait for space)
+    S.windows[w] = -2;
+    size_t off = 0;
+    int    n_stuck = 0;
+    while (!take_range(total, &off)) {
+        if (evict_one()) {
+            continue;
+        }
+        S.n_wait++;
+        if (++n_stuck > 200) {
+            S.windows.erase(w);
+            S.cv_done.notify_all();
+            return false;
+        }
+        S.cv_done.wait(lk);
+    }
+
+    int64_t idx = -1;
+    for (size_t i = 0; i < S.slots.size(); ++i) {
+        if (S.slots[i].owner == nullptr) {
+            idx = (int64_t) i;
+            break;
+        }
+    }
+    if (idx < 0) {
+        S.slots.emplace_back();
+        idx = (int64_t) S.slots.size() - 1;
+    }
+    {
+        arena_slot & sl = S.slots[idx];
+        sl.off   = off;
+        sl.size  = total;
+        sl.owner = w;
+        sl.pins  = 1;
+        sl.tick  = ++S.tick;
+    }
+
+    S.window_saved[w] = (uint8_t *) w->data;
+
+    // read the unique rows into the compact block (buffered reads: rows are scattered)
+    for (size_t j = 0; j < uniq.size(); ++j) {
+        if (!read_exact(wdt.fd_buf, S.arena + off + j * row_bytes, row_bytes,
+                        wdt.off + (size_t) uniq[j] * row_bytes)) {
+            free_range(off, total);
+            S.slots[idx].owner = nullptr;
+            S.window_saved.erase(w);
+            S.windows.erase(w);
+            S.cv_done.notify_all();
+            return false;
+        }
+    }
+
+    // remap the ids and point the weight at the compact block (row j == compact index j)
+    std::vector<int32_t> orig((size_t) n);
+    memcpy(orig.data(), ids, (size_t) n * sizeof(int32_t));
+    int32_t * ids_mut = (int32_t *) ix->data;
+    for (int64_t i = 0; i < n; ++i) {
+        ids_mut[i] = remap[(size_t) i];
+    }
+    state::window_restore rest;
+    rest.ids  = ix;
+    rest.orig = std::move(orig);
+    S.window_restore_map[w] = std::move(rest);
+
+    w->data = S.arena + off;
+    S.windows[w] = idx;
+    S.slots[idx].pins = 1;
+    S.cv_done.notify_all();
+    return true;
+}
+
 // a GET_ROWS node only reads a handful of rows out of a huge embedding table, load just those
 bool ensure_rows_window(std::unique_lock<std::mutex> & lk, ggml_tensor * node) {
     ggml_tensor * w  = node->src[0];
     ggml_tensor * ix = node->src[1];
 
     if (w == nullptr || ix == nullptr || ix->data == nullptr || ix->type != GGML_TYPE_I32) {
+        if (S.window_dbg) fprintf(stderr, "llama-disk[win]: rows skip: bad tensor/ids (%s)\n", ggml_get_name(w ? w : node->src[0]));
         return false;
     }
     if (w->ne[1] <= 1 || S.windows.count(w) > 0) {
+        if (S.window_dbg) fprintf(stderr, "llama-disk[win]: rows skip: window_exists=%d ne1=%lld\n",
+                                   (int) S.windows.count(w), (long long) w->ne[1]);
         return false;
     }
 
@@ -781,8 +962,11 @@ bool ensure_rows_window(std::unique_lock<std::mutex> & lk, ggml_tensor * node) {
     }
 
     const int64_t n = ggml_nelements(ix);
-    if (n < 1 || n > 8) {
+    if (n < 1) {
         return false;
+    }
+    if (n > 8) {
+        return ensure_rows_compact(lk, node);
     }
 
     const size_t row_bytes = w->nb[1];
@@ -800,10 +984,15 @@ bool ensure_rows_window(std::unique_lock<std::mutex> & lk, ggml_tensor * node) {
 
     const size_t span = (size_t) (rmax - rmin + 1) * row_bytes;
     if (span > S.arena_size / 2) {
-        return false;
+        if (S.window_dbg) fprintf(stderr, "llama-disk[win]: rows span %zu > arena/2, using compact gather\n", span);
+        return ensure_rows_compact(lk, node);
     }
 
     const disk_tensor & wdt = it->second;
+
+    // claim the window before load_into() releases the lock for the pread: another compute
+    // thread that asks for the same tensor while it is being installed waits below
+    S.windows[w] = -2;
 
     disk_tensor dt;
     dt.fd     = wdt.fd_buf; // a few rows, buffered is fine
@@ -812,16 +1001,32 @@ bool ensure_rows_window(std::unique_lock<std::mutex> & lk, ggml_tensor * node) {
     dt.size   = span;
     dt.fsize  = wdt.fsize;
 
+    uint8_t * saved = (uint8_t *) w->data;
+
     int64_t slot = -1;
     if (!load_into(lk, w, dt, true, false, &slot)) {
+        S.windows.erase(w);
+        S.cv_done.notify_all();
         return false;
     }
 
-    // rows of the table are contiguous, so the window can be shifted under the whole tensor
-    uint8_t * base = S.arena + S.slots[slot].off;
+    // remember the pointer we are about to overwrite: the parent may be fully resident as well
+    S.window_saved[w] = saved;
+
+    // rows of the table are contiguous, so the window can be shifted under the whole tensor.
+    // load_into() already put w->data at the first byte of the requested range (it includes the
+    // O_DIRECT alignment delta), so only step back by the rows that precede the first one.
+    uint8_t * base = (uint8_t *) w->data;
     w->data = base - (size_t) rmin * row_bytes;
 
-    S.windows.emplace(w, slot);
+    S.windows[w] = slot;
+    S.slots[slot].pins = 1; // pinned for this node, other threads pin when they find the window
+    S.cv_done.notify_all();
+
+    if (S.window_dbg) {
+        fprintf(stderr, "llama-disk[win]: rows window %s ids=%lld..%lld span=%zu slot=%lld\n",
+                ggml_get_name(w), (long long) rmin, (long long) rmax, span, (long long) slot);
+    }
 
     return true;
 }
@@ -843,9 +1048,29 @@ bool ensure_window(std::unique_lock<std::mutex> & lk, ggml_tensor * t, ggml_tens
 
     auto wit = S.windows.find(t);
     if (wit != S.windows.end()) {
-        S.slots[wit->second].pins++;
+        int64_t slot = wit->second;
+        if (slot == -2) {
+            // another compute thread is installing this window right now
+            while (true) {
+                auto it2 = S.windows.find(t);
+                if (it2 == S.windows.end()) {
+                    return false; // the installer failed
+                }
+                if (it2->second != -2) {
+                    slot = it2->second;
+                    break;
+                }
+                S.n_wait++;
+                S.cv_done.wait(lk);
+            }
+        }
+        S.slots[slot].pins++;
         return true;
     }
+
+    // claim before load_into() releases the lock for the pread
+    S.windows[t] = -2;
+    uint8_t * saved = (uint8_t *) t->data;
 
     disk_tensor dt;
     dt.fd     = pdt.fd;
@@ -856,13 +1081,58 @@ bool ensure_window(std::unique_lock<std::mutex> & lk, ggml_tensor * t, ggml_tens
 
     int64_t slot = -1;
     if (!load_into(lk, t, dt, true, false, &slot)) {
+        S.windows.erase(t);
+        S.cv_done.notify_all();
         return false;
     }
 
-    S.windows.emplace(t, slot);
-    S.slots[slot].pins++;
+    // remember the pointer we are about to overwrite (it may be a view into a resident parent)
+    S.window_saved[t] = saved;
+
+    S.windows[t] = slot;
+    S.slots[slot].pins = 1;
+    S.cv_done.notify_all();
 
     return true;
+}
+
+// free the windows whose pins reached zero, called with the lock held at the start of a node
+void drain_deferred_windows() {
+    if (S.windows_defer.empty()) {
+        return;
+    }
+    std::vector<ggml_tensor *> keep;
+    keep.reserve(S.windows_defer.size());
+    for (ggml_tensor * t : S.windows_defer) {
+        auto wit = S.windows.find(t);
+        if (wit == S.windows.end() || wit->second < 0) {
+            continue;
+        }
+        const int64_t slot = wit->second;
+        if (S.slots[slot].pins > 0) {
+            // somebody pinned it again after the last unpin
+            keep.push_back(t);
+            continue;
+        }
+        arena_slot & sl = S.slots[slot];
+        free_range(sl.off, sl.size);
+        sl.owner = nullptr;
+        auto sit = S.window_saved.find(t);
+        t->data = sit != S.window_saved.end() ? sit->second : S.placeholder;
+        if (sit != S.window_saved.end()) {
+            S.window_saved.erase(sit);
+        }
+        auto rit = S.window_restore_map.find(t);
+        if (rit != S.window_restore_map.end()) {
+            if (rit->second.ids != nullptr && !rit->second.orig.empty()) {
+                memcpy(rit->second.ids->data, rit->second.orig.data(),
+                       rit->second.orig.size() * sizeof(int32_t));
+            }
+            S.window_restore_map.erase(rit);
+        }
+        S.windows.erase(wit);
+    }
+    S.windows_defer.swap(keep);
 }
 
 void ensure_tree(std::unique_lock<std::mutex> & lk, ggml_tensor * t) {
@@ -871,14 +1141,35 @@ void ensure_tree(std::unique_lock<std::mutex> & lk, ggml_tensor * t) {
     }
     auto wit = S.windows.find(t);
     if (wit != S.windows.end()) {
-        S.slots[wit->second].pins++;
-        return;
+        while (wit != S.windows.end() && wit->second == -2) {
+            // another compute thread is installing this window right now
+            S.n_wait++;
+            S.cv_done.wait(lk);
+            wit = S.windows.find(t);
+        }
+        if (wit != S.windows.end()) {
+            if (S.slots[wit->second].owner != t) {
+                if (S.window_dbg) {
+                    fprintf(stderr, "llama-disk[win]: STALE window entry for %s (slot %lld owner %s)\n",
+                            ggml_get_name(t), (long long) wit->second,
+                            S.slots[wit->second].owner ? ggml_get_name(S.slots[wit->second].owner) : "(null)");
+                }
+                S.windows.erase(wit);
+            } else {
+                S.slots[wit->second].pins++;
+                return;
+            }
+        }
     }
     if (t->view_src != nullptr) {
-        if (S.window && S.tensors.count(t->view_src) > 0 && ggml_is_contiguous(t)) {
+        if (S.window && S.window_views && S.tensors.count(t->view_src) > 0 && ggml_is_contiguous(t)) {
             if (ensure_window(lk, t, t->view_src)) {
                 return;
             }
+        }
+        if (S.window_dbg) {
+            fprintf(stderr, "llama-disk[win]: view %s -> fallback parent %s\n",
+                    ggml_get_name(t), ggml_get_name(t->view_src));
         }
         ensure_tree(lk, t->view_src);
         t->data = (uint8_t *) t->view_src->data + t->view_offs;
@@ -894,15 +1185,27 @@ void unpin_tree(ggml_tensor * t) {
     auto wit = S.windows.find(t);
     if (wit != S.windows.end()) {
         arena_slot & sl = S.slots[wit->second];
+        if (S.window_dbg && sl.owner != t) {
+            fprintf(stderr, "llama-disk[win]: free %s but slot owner is %s\n",
+                    ggml_get_name(t), sl.owner ? ggml_get_name(sl.owner) : "(null)");
+        }
         if (sl.pins > 0) {
             sl.pins--;
         }
         if (sl.pins == 0) {
-            // the window was only needed by this node
-            free_range(sl.off, sl.size);
-            sl.owner = nullptr;
-            t->data  = S.placeholder;
-            S.windows.erase(wit);
+            // the window was only needed by this node. do not free it here: another compute
+            // thread may still be waiting for it (some ops run on thread 0 only), so the free
+            // is deferred to the start of the next node, after the node barrier
+            bool queued = false;
+            for (ggml_tensor * d : S.windows_defer) {
+                if (d == t) {
+                    queued = true;
+                    break;
+                }
+            }
+            if (!queued) {
+                S.windows_defer.push_back(t);
+            }
         }
         return;
     }
@@ -911,6 +1214,322 @@ void unpin_tree(ggml_tensor * t) {
         return;
     }
     unpin(t);
+}
+
+// --------------------------------------------------------------- MoE fast path
+//
+// A MUL_MAT_ID node only multiplies the experts the router picked, but its weight tensor
+// holds every expert. Stream just the picked slices into one compact block of the arena,
+// renumber the ids to the compact slots and point the weight tensor at the block while
+// the node runs (ne[2] is temporarily set to the number of picked experts so that the
+// per-expert stride arithmetic of the kernels lines up with the compact block). Every
+// assumption is checked; anything unexpected falls back to the whole-tensor load.
+
+bool moe_try_node(std::unique_lock<std::mutex> & lk, ggml_tensor * node) {
+    ggml_tensor * w   = node->src[0];
+    ggml_tensor * ids = node->src[2];
+    if (w == nullptr || ids == nullptr) {
+        return false;
+    }
+
+    // another thread of this graph already installed (or is installing) the window
+    for (;;) {
+        auto wit = S.moe_windows.find(w);
+        if (wit == S.moe_windows.end()) {
+            break;
+        }
+        if (wit->second.state == MOE_WIN_LOADING) {
+            S.n_wait++;
+            S.cv_done.wait(lk);
+            continue;
+        }
+        arena_slot & sl = S.slots[wit->second.slot];
+        sl.pins++;
+        sl.tick      = ++S.tick;
+        tls_moe_w    = w;
+        tls_moe_used = true;
+        return true;
+    }
+
+    auto no = [&](const char * why) {
+        S.n_moe_fallback++;
+        if (S.verbose) {
+            dmsg("llama-disk[moe]: '%s' falls back to the whole tensor (%s)\n",
+                    ggml_get_name(w), why);
+        }
+        return false;
+    };
+
+    if (w->ne[2] < 2 || w->ne[3] != 1)   return no("weight is not a 3d expert tensor");
+    if (w->view_src != nullptr)          return no("weight is a view");
+    if (w->nb[0] != ggml_type_size(w->type)) return no("weight is permuted");
+
+    auto it = S.tensors.find(w);
+    if (it == S.tensors.end()) return no("weight is not streamed");
+    disk_tensor & dt = it->second;
+    if (dt.state == ST_LOADING) return no("weight is being loaded right now");
+    if (dt.state != ST_ABSENT) {
+        // a previous fallback (or the prefetcher) may have left the whole tensor resident.
+        // the compact block is a lot smaller, so take the arena block back when nobody uses it
+        if (dt.state == ST_RESIDENT && dt.slot >= 0) {
+            arena_slot & sl = S.slots[dt.slot];
+            if (sl.pins > 0 || sl.owner != w) {
+                return no("whole weight is pinned by another node");
+            }
+            sl.owner = nullptr;
+            sl.pins  = 0;
+            dt.state = ST_ABSENT;
+            dt.slot  = -1;
+            w->data  = S.placeholder;
+            free_range(sl.off, sl.size);
+            S.bytes_evicted += sl.size;
+            S.n_evict++;
+        } else {
+            return no("weight is already queued or resident");
+        }
+    }
+    if ((size_t) w->ne[2] * w->nb[2] != dt.size) return no("unexpected expert stride");
+    if (dt.fsize > 0 && dt.off + dt.size > dt.fsize) return no("weight is outside the file");
+
+    // the ids tensor: [n_expert_used, n_tokens], int32. it is usually a view of the argsort
+    // result, so the rows keep the full n_expert stride - read and copy through the strides
+    if (ids->type != GGML_TYPE_I32) return no("ids are not i32");
+    if (ids->data == nullptr)       return no("ids are not computed yet");
+    if (ids->ne[2] != 1 || ids->ne[3] != 1) return no("ids are not 2d");
+    if (ids->nb[0] != sizeof(int32_t)) return no("ids element size mismatch");
+    if (ids->nb[1] < (size_t) ids->ne[0] * sizeof(int32_t)) return no("ids rows are overlapping");
+    if ((ids->nb[1] % sizeof(int32_t)) != 0) return no("ids row stride is not i32 aligned");
+    if (((uintptr_t) ids->data & (sizeof(int32_t) - 1)) != 0) return no("ids are unaligned");
+
+    const int64_t n_expert = w->ne[2];
+    const int64_t n_ids    = ggml_nelements(ids);
+    if (n_ids < 1 || n_ids > (int64_t) (1 << 20)) return no("unexpected ids count");
+
+    const char * ids_base = (const char *) ids->data;
+    tls_moe_ids.clear();
+    tls_moe_ids.reserve((size_t) n_ids);
+    for (int64_t i1 = 0; i1 < ids->ne[1]; ++i1) {
+        for (int64_t i0 = 0; i0 < ids->ne[0]; ++i0) {
+            const int32_t id = *(const int32_t *) (ids_base + i1 * ids->nb[1] + i0 * ids->nb[0]);
+            // upstream ggml_mul_mat_id allows -1 to skip a slot (the kernel zeroes that
+            // output row), every other id must name one of the experts of the tensor
+            if (id < -1 || id >= n_expert) return no("expert id out of range");
+            tls_moe_ids.push_back(id);
+        }
+    }
+
+    // stream only the experts that are actually routed to; -1 is a "skip this slot"
+    // marker of the upstream kernel and has no weight slice behind it
+    tls_moe_sel = tls_moe_ids;
+    tls_moe_sel.erase(std::remove(tls_moe_sel.begin(), tls_moe_sel.end(), -1), tls_moe_sel.end());
+    std::sort(tls_moe_sel.begin(), tls_moe_sel.end());
+    tls_moe_sel.erase(std::unique(tls_moe_sel.begin(), tls_moe_sel.end()), tls_moe_sel.end());
+
+    const int64_t n_sel = (int64_t) tls_moe_sel.size();
+    if (n_sel < 1) {
+        // every slot is skipped: nothing to stream, the whole-tensor path stays correct
+        return no("all expert slots are skipped (-1)");
+    }
+    if (n_sel >= n_expert) return no("all experts selected");
+
+    const size_t expert_bytes = (size_t) w->nb[2];
+    const size_t data_bytes   = (size_t) n_sel * expert_bytes;
+    const size_t ids_off      = align_up(data_bytes, 64);
+    const size_t remap_bytes  = (size_t) ids->ne[1] * ids->nb[1]; // including the row padding
+    const size_t need         = align_up(ids_off + remap_bytes);
+
+    if (data_bytes > S.arena_size || need > S.arena_size) {
+        return no("expert block does not fit in the arena");
+    }
+
+    // original id -> compact slot, in the order the kernel reads the ids; -1 stays -1
+    tls_moe_remap.resize((size_t) n_ids);
+    for (int64_t i = 0; i < n_ids; ++i) {
+        const int32_t id = tls_moe_ids[(size_t) i];
+        if (id < 0) {
+            tls_moe_remap[(size_t) i] = -1;
+            continue;
+        }
+        const auto lb = std::lower_bound(tls_moe_sel.begin(), tls_moe_sel.end(), id);
+        tls_moe_remap[(size_t) i] = (int32_t) (lb - tls_moe_sel.begin());
+    }
+
+    // same placement loop as load_into(): a big block drains the prefetcher, then evicts
+    size_t off = 0;
+    int n_stuck = 0;
+    const bool want_drain = need >= S.drain_threshold;
+    if (want_drain) {
+        S.drain = true;
+        while (S.n_loading > 0) {
+            S.n_wait++;
+            S.cv_done.wait(lk);
+        }
+    }
+    while (!take_range(need, &off)) {
+        if (evict_one()) {
+            continue;
+        }
+        if (++n_stuck > 200) {
+            if (want_drain) {
+                S.drain = false;
+            }
+            return no("no room in the arena");
+        }
+        S.n_wait++;
+        S.cv_done.wait(lk);
+    }
+    if (want_drain) {
+        S.drain = false;
+    }
+
+    int64_t idx = -1;
+    for (size_t i = 0; i < S.slots.size(); ++i) {
+        if (S.slots[i].owner == nullptr) {
+            idx = (int64_t) i;
+            break;
+        }
+    }
+    if (idx < 0) {
+        if (S.slots.size() >= S.slots.capacity()) {
+            // would invalidate the index across the unlock below; never expected (reserved in init)
+            free_range(off, need);
+            return no("slot table is full");
+        }
+        S.slots.emplace_back();
+        idx = (int64_t) S.slots.size() - 1;
+    }
+    {
+        arena_slot & sl = S.slots[idx];
+        sl.off   = off;
+        sl.size  = need;
+        sl.owner = w;
+        sl.pins  = 1; // the load pin; it becomes the electing thread's pin
+        sl.tick  = ++S.tick;
+    }
+
+    S.n_loading++;
+
+    moe_window win;
+    win.w        = w;
+    win.ids      = ids;
+    win.slot     = idx;
+    win.state    = MOE_WIN_LOADING;
+    win.ne2      = w->ne[2];
+    win.w_data   = (uint8_t *) w->data;
+    win.ids_data = (uint8_t *) ids->data;
+    S.moe_windows.emplace(w, win);
+
+    uint8_t * const base = S.arena + off;
+
+    // the copy runs without the lock (the other threads wait on MOE_WIN_LOADING), the
+    // reserved slot is pinned so it cannot be evicted while the slices are streamed in
+    lk.unlock();
+    const uint64_t t0 = now_us();
+    bool ok = true;
+    for (int64_t i = 0; ok && i < n_sel; ) {
+        int64_t j = i + 1;
+        while (j < n_sel && tls_moe_sel[(size_t) j] == tls_moe_sel[(size_t) j - 1] + 1) {
+            j++; // adjacent experts: one read for the run
+        }
+        ok = read_exact(dt.fd_buf, base + (size_t) i * expert_bytes,
+                (size_t) (j - i) * expert_bytes,
+                dt.off + (size_t) tls_moe_sel[(size_t) i] * expert_bytes);
+        i = j;
+    }
+    const uint64_t dt_us = now_us() - t0;
+    lk.lock();
+
+    S.t_read += dt_us;
+    S.n_loading--;
+
+    // the slot vector never reallocates (reserved in init), never keep a reference across the unlock
+    arena_slot & sl = S.slots[idx];
+
+    if (!ok) {
+        // let the regular whole-tensor load below try instead of failing the run
+        sl.owner = nullptr;
+        sl.pins  = 0;
+        free_range(off, need);
+        S.moe_windows.erase(w);
+        S.cv_done.notify_all();
+        return false;
+    }
+
+    // compact block is in place: renumber the ids (through the original strides) and publish
+    uint8_t * compact_ids = base + ids_off;
+    for (int64_t i1 = 0; i1 < ids->ne[1]; ++i1) {
+        for (int64_t i0 = 0; i0 < ids->ne[0]; ++i0) {
+            const size_t elem = (size_t) (i1 * ids->ne[0] + i0);
+            *(int32_t *) (compact_ids + i1 * ids->nb[1] + i0 * ids->nb[0]) = tls_moe_remap[elem];
+        }
+    }
+
+    w->data   = base;
+    w->ne[2]  = n_sel;
+    ids->data = (uint8_t *) compact_ids;
+
+    auto wit = S.moe_windows.find(w);
+    if (wit == S.moe_windows.end()) {
+        // cannot happen while this node is running, but never leave the tensors patched
+        w->data   = win.w_data;
+        w->ne[2]  = win.ne2;
+        ids->data = win.ids_data;
+        sl.owner  = nullptr;
+        sl.pins   = 0;
+        free_range(off, need);
+        return false;
+    }
+    wit->second.state = MOE_WIN_READY;
+
+    S.n_load++;
+    S.bytes_loaded += data_bytes;
+    S.n_moe_nodes++;
+    S.n_moe_experts += (uint64_t) n_sel;
+    S.n_moe_bytes   += data_bytes;
+
+    if (S.verbose) {
+        dmsg("llama-disk[moe]: '%s' selected %d/%d experts, %zu KiB, %d ids\n",
+                ggml_get_name(w), (int) n_sel, (int) n_expert, data_bytes >> 10, (int) n_ids);
+    }
+
+    tls_moe_w    = w;
+    tls_moe_used = true;
+
+    S.cv_done.notify_all();
+    return true;
+}
+
+// drop this thread's pin on the compact window, the last one restores the tensors and frees it
+void moe_release(ggml_tensor * w) {
+    auto it = S.moe_windows.find(w);
+    if (it == S.moe_windows.end()) {
+        return;
+    }
+
+    moe_window & win = it->second;
+    if (win.state == MOE_WIN_LOADING) {
+        return; // a pin is only handed out once the window is ready
+    }
+
+    arena_slot & sl = S.slots[win.slot];
+    if (sl.pins > 0) {
+        sl.pins--;
+    }
+    if (sl.pins > 0) {
+        return;
+    }
+
+    // last user: put the tensors back the way the rest of the engine expects them
+    w->data       = win.w_data;
+    w->ne[2]      = win.ne2;
+    win.ids->data = win.ids_data;
+
+    free_range(sl.off, sl.size);
+    sl.owner = nullptr;
+    sl.pins  = 0;
+
+    S.moe_windows.erase(it);
+    S.cv_done.notify_all();
 }
 
 // hand the given tensor to the reader, best effort
@@ -981,7 +1600,22 @@ void node_cb(ggml_tensor * node, bool done) {
         return;
     }
 
+    // ggml does not compute empty nodes at all (zero tokens, e.g. the unused MTP/nextn block),
+    // so their weights are never touched and must not be paged in
+    if (ggml_is_empty(node)) {
+        return;
+    }
+
     std::unique_lock<std::mutex> lk(S.mtx);
+
+    if (!done) {
+        drain_deferred_windows();
+        tls_cur_node = node;
+        // a new node: forget the window this thread pinned for the previous one
+        tls_moe_w    = nullptr;
+        tls_moe_used = false;
+        tls_rows_w   = nullptr;
+    }
 
     if (!done && S.fail) {
         // keep going, the output will be garbage but we must not leak pins
@@ -989,6 +1623,8 @@ void node_cb(ggml_tensor * node, bool done) {
     }
 
     S.n_cb++;
+
+    const bool is_moe_node = S.moe && node->op == GGML_OP_MUL_MAT_ID;
 
     if (!done && S.prefetch) {
         // the weights are read in file order, so the next tensors of the file are a good
@@ -1015,8 +1651,28 @@ void node_cb(ggml_tensor * node, bool done) {
         }
     }
 
-    if (!done && S.window && node->op == GGML_OP_GET_ROWS) {
-        ensure_rows_window(lk, node);
+    if (!done && S.window && S.window_rows && node->op == GGML_OP_GET_ROWS) {
+        if (ensure_rows_window(lk, node)) {
+            // ensure_rows_window() already pinned the window for this node; remember it so
+            // the generic source loop below does not pin the same tensor a second time
+            tls_rows_w = node->src[0];
+        }
+    }
+
+    // MoE fast path: the expert weights come from a compact window instead of the whole
+    // tensor, src[0] (weights) and src[2] (ids) are already prepared by moe_try_node()
+    bool moe_handled = false;
+    if (is_moe_node) {
+        if (!done) {
+            moe_handled = moe_try_node(lk, node);
+        } else {
+            moe_handled = tls_moe_used && tls_moe_w == node->src[0];
+            if (moe_handled) {
+                moe_release(node->src[0]);
+                tls_moe_w    = nullptr;
+                tls_moe_used = false;
+            }
+        }
     }
 
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
@@ -1024,10 +1680,21 @@ void node_cb(ggml_tensor * node, bool done) {
         if (src == nullptr) {
             continue;
         }
+        if (moe_handled && (i == 0 || i == 2)) {
+            continue; // supplied by the compact expert window
+        }
 
         if (!done) {
+            if (src == tls_rows_w) {
+                continue;   // already pinned by ensure_rows_window()
+            }
             ensure_tree(lk, src);
         } else {
+            if (src == tls_rows_w) {
+                unpin_tree(src);
+                tls_rows_w = nullptr;
+                continue;
+            }
             unpin_tree(src);
         }
     }
@@ -1044,6 +1711,12 @@ void node_cb(ggml_tensor * node, bool done) {
                 (unsigned long long) (S.bytes_loaded >> 20), (unsigned long long) S.n_evict,
                 (unsigned long long) (S.t_read / 1000000), (unsigned long long) (S.t_read / 100000 % 10),
                 (unsigned long long) S.n_wait);
+        if (S.moe) {
+            dmsg("llama-disk[moe]: nodes = %llu, experts = %llu, expert read = %llu MiB, fallbacks = %llu\n",
+                    (unsigned long long) S.n_moe_nodes, (unsigned long long) S.n_moe_experts,
+                    (unsigned long long) (S.n_moe_bytes >> 20),
+                    (unsigned long long) S.n_moe_fallback);
+        }
     }
 }
 
@@ -1148,11 +1821,23 @@ bool enabled() {
     return on;
 }
 
-int out_chunk_rows() {
-    static const int rows = [] {
+bool moe_enabled() {
+    static const bool on = [] {
+        // only meaningful while the weights are streamed from disk
         if (!enabled()) {
-            return 0;
+            return false;
         }
+        const char * env = getenv("LLAMA_DISK_MOE");
+        return env != nullptr && atoi(env) == 1;
+    }();
+    return on;
+}
+
+int out_chunk_rows() {
+    if (!enabled()) {
+        return 0;
+    }
+    static const int rows = [] {
         const char * env = getenv("LLAMA_DISK_OUT_CHUNK");
         if (env == nullptr) {
             return 0;
@@ -1160,7 +1845,63 @@ int out_chunk_rows() {
         const int n = atoi(env);
         return n > 0 ? n : 0;
     }();
-    return rows;
+    if (rows > 0) {
+        return rows;
+    }
+    return S.tiny ? S.auto_chunk_rows : 0;
+}
+
+bool tiny_arena_mode() {
+    return enabled() && S.tiny;
+}
+
+bool split_all_matmul() {
+    if (!enabled()) {
+        return false;
+    }
+    static const int env = [] {
+        const char * e = getenv("LLAMA_DISK_SPLIT_MM");
+        return e != nullptr ? atoi(e) : -1;
+    }();
+    if (env >= 0) {
+        return env == 1;
+    }
+    return S.tiny;
+}
+
+int matmul_chunk_rows(int64_t ne1, size_t row_bytes) {
+    if (!enabled() || row_bytes == 0 || ne1 <= 0) {
+        return 0;
+    }
+    static const int rows_env = [] {
+        const char * env = getenv("LLAMA_DISK_OUT_CHUNK");
+        if (env == nullptr) {
+            return 0;
+        }
+        const int n = atoi(env);
+        return n > 0 ? n : 0;
+    }();
+    if (rows_env > 0) {
+        return rows_env;
+    }
+    if (!S.tiny) {
+        return 0;
+    }
+    // one chunk ~1/4 of the arena, at least 256 rows, at most 64 chunks per tensor so the graph
+    // does not explode for large output layers
+    int64_t rows = (int64_t) (std::max<size_t>(S.arena_size / 4, 2u << 20) / row_bytes);
+    rows = std::max<int64_t>(rows, 256);
+    rows = std::max<int64_t>(rows, (ne1 + 63) / 64);
+    rows = std::min<int64_t>(rows, 16384);
+    return (int) rows;
+}
+
+int64_t split_threshold_bytes() {
+    if (!S.tiny) {
+        return 0;
+    }
+    // split a weight whose read would not leave room for the other tensors of the node
+    return (int64_t) (S.arena_size * 3 / 5);
 }
 
 void init() {
@@ -1193,10 +1934,25 @@ void init() {
     S.verbose = env_v != nullptr && atoi(env_v) == 1;
 
     const char * env_win = getenv("LLAMA_DISK_WINDOW");
-    S.window = env_win != nullptr && atoi(env_win) == 1;
+    const int    win_mode = env_win != nullptr ? atoi(env_win) : 0;
+    const char * env_wdbg = getenv("LLAMA_DISK_WINDOW_DEBUG");
+    S.window_dbg = env_wdbg != nullptr && atoi(env_wdbg) == 1;
+    S.window = win_mode > 0;
+    S.window_rows  = (win_mode == 1 || win_mode == 2);
+    S.window_views = (win_mode == 1 || win_mode == 3);
 
     const char * env_dbg = getenv("LLAMA_DISK_DEBUG");
     S.debug = env_dbg != nullptr && atoi(env_dbg) == 1;
+
+    S.moe = moe_enabled();
+    if (S.moe) {
+        dmsg("llama-disk: MoE fast path on, only the experts selected by the router are streamed\n");
+        if (S.prefetch) {
+            // the prefetcher walks the file order and would read the whole expert tensors
+            S.prefetch = false;
+            dmsg("llama-disk: prefetch disabled while the MoE fast path is on\n");
+        }
+    }
 
     // node fusion would skip nodes, and a skipped node never gets its weights paged in
     if (getenv("GGML_CPU_DISABLE_FUSION") == nullptr) {
@@ -1250,6 +2006,15 @@ static size_t meminfo_kb(const char * key) {
 #endif
 }
 
+// LLAMA_DISK_TINY_ARENA=0 disables the automatic tiny-arena mode, everything else keeps it on
+static bool tiny_arena_disabled() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_DISK_TINY_ARENA");
+        return e != nullptr && atoi(e) == 0;
+    }();
+    return v;
+}
+
 // size and allocate the arena now that every tensor (and so the biggest one) is known
 static bool alloc_arena() {
     const size_t need = align_up(S.max_tensor) + (24u << 20);
@@ -1261,15 +2026,23 @@ static bool alloc_arena() {
         want = tot_kb > 0 ? (((tot_kb >> 10) / 8) << 20) : (256u << 20);
         why = "auto, 1/8 of ram";
     }
-    if (want < need) {
+    // only an explicit request goes below the largest tensor; the automatic 1/8-of-ram size
+    // keeps the old behaviour (raised to fit the largest tensor)
+    if (want < need && S.arena_req > 0 && !tiny_arena_disabled()) {
+        S.tiny = true;
+        dmsg("llama-disk: tiny arena mode: arena %zu MiB < largest tensor '%s' (%zu MiB), "
+             "big tensors will be read in chunks\n",
+                want >> 20, S.name_max.c_str(), S.max_tensor >> 20);
+    } else if (want < need) {
         dmsg("llama-disk: arena %zu MiB cannot hold the largest tensor '%s' (%zu MiB), raised to %zu MiB\n",
                 want >> 20, S.name_max.c_str(), S.max_tensor >> 20, need >> 20);
         want = need;
         why = "raised to fit the largest tensor";
     }
-    if (want < (128u << 20)) {
-        want = 128u << 20;
-        why = "128 MiB floor";
+    const size_t floor_mb = S.tiny ? 8u : 128u;
+    if (want < (floor_mb << 20)) {
+        want = floor_mb << 20;
+        why = S.tiny ? "8 MiB floor (tiny arena)" : "128 MiB floor";
     }
     if (want > (2048u << 20)) {
         want = 2048u << 20;
@@ -1401,6 +2174,7 @@ void register_tensor(ggml_tensor * t, int fd, size_t off, size_t nbytes) {
     t->data = S.placeholder;
 
     S.bytes_registered += nbytes;
+    S.max_row_bytes = std::max(S.max_row_bytes, (size_t) t->nb[1]);
     if (nbytes > S.max_tensor) {
         S.max_tensor = nbytes;
         S.name_max   = ggml_get_name(t);
@@ -1420,13 +2194,37 @@ void finish_register() {
         return;
     }
 
+    if (S.tiny) {
+        if (!S.window) {
+            // big tensors have to be read as rows/views: no single read may need a whole tensor
+            S.window       = true;
+            S.window_rows  = true;
+            S.window_views = true;
+        }
+        // keep one chunk around 1/5 of the arena (a chunk fits together with the other tensors
+        // of the node and the rows/experts windows that are pinned at the same time)
+        if (S.max_row_bytes > 0) {
+            int64_t rows = (int64_t) ((S.arena_size / 5) / S.max_row_bytes);
+            rows = std::max<int64_t>(256, std::min<int64_t>(rows, 16384));
+            S.auto_chunk_rows = (int) rows;
+        }
+        dmsg("llama-disk: tiny arena: chunked reads, %d rows per matmul chunk, windows on\n",
+                S.auto_chunk_rows);
+    }
+
     if (align_up(S.max_tensor + S.align_io) > S.arena_size) {
-        char msg[512];
-        snprintf(msg, sizeof(msg),
-                 "arena is %zu MiB but the largest tensor '%s' needs %zu MiB",
-                 S.arena_size >> 20, S.name_max.c_str(),
-                 align_up(S.max_tensor + S.align_io) >> 20);
-        throw std::runtime_error(msg);
+        if (S.tiny) {
+            dmsg("llama-disk: tiny-arena: largest tensor '%s' (%zu MiB) exceeds the arena, "
+                 "it must be read in chunks\n",
+                    S.name_max.c_str(), S.max_tensor >> 20);
+        } else {
+            char msg[512];
+            snprintf(msg, sizeof(msg),
+                     "arena is %zu MiB but the largest tensor '%s' needs %zu MiB",
+                     S.arena_size >> 20, S.name_max.c_str(),
+                     align_up(S.max_tensor + S.align_io) >> 20);
+            throw std::runtime_error(msg);
+        }
     }
 
     if (S.prefetch) {
@@ -1477,6 +2275,22 @@ void cleanup() {
         S.watchdog.join();
     }
 
+    {
+        // never leave a weight tensor pointing into the arena: patch every live MoE window back
+        std::lock_guard<std::mutex> lk(S.mtx);
+        for (auto & kv : S.moe_windows) {
+            moe_window & win = kv.second;
+            if (win.w != nullptr) {
+                win.w->data  = win.w_data;
+                win.w->ne[2] = win.ne2;
+            }
+            if (win.ids != nullptr) {
+                win.ids->data = win.ids_data;
+            }
+        }
+        S.moe_windows.clear();
+    }
+
     for (const auto & info : S.fds) {
         if (handle_ok(info.fd) && info.fd != info.fd_buf) {
             close_disk_handle(info.fd);
@@ -1496,6 +2310,9 @@ void cleanup() {
     S.fd_map.clear();
     S.tensors.clear();
     S.windows.clear();
+    S.window_saved.clear();
+    S.windows_defer.clear();
+    S.window_restore_map.clear();
     S.order.clear();
     S.slots.clear();
     S.free_blk.clear();
@@ -1528,6 +2345,11 @@ void cleanup() {
     S.bytes_registered = 0;
     S.bytes_loaded     = 0;
     S.bytes_evicted    = 0;
+    S.n_moe_nodes      = 0;
+    S.n_moe_experts    = 0;
+    S.n_moe_bytes      = 0;
+    S.n_moe_fallback   = 0;
+    S.moe              = false;
 }
 
 void set_msg_cb(void (*cb)(const char *)) {
@@ -1560,6 +2382,12 @@ void get_stats(struct llama_disk_stats * out) {
     out->direct_io        = S.odirect  ? 1 : 0;
     out->mlock            = S.mlock    ? 1 : 0;
     out->prefetch         = S.prefetch ? 1 : 0;
+    out->tiny             = S.tiny ? 1 : 0;
+    out->chunk_rows       = S.tiny ? S.auto_chunk_rows : 0;
+    out->moe              = S.moe      ? 1 : 0;
+    out->moe_nodes        = S.n_moe_nodes;
+    out->moe_experts      = S.n_moe_experts;
+    out->moe_expert_bytes = S.n_moe_bytes;
 
     if (S.debug) {
         static int n = 0;

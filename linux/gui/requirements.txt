@@ -1,0 +1,9 @@
+# GUI workbench for the diskinfer Linux port.
+# PySide6 is the only dependency (Qt 6 bindings); nothing else is required.
+#
+# Install it into the project venv with the Tsinghua mirror:
+#   gui/setup-venv.sh
+# or manually:
+#   python3 -m venv .venv
+#   .venv/bin/python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r gui/requirements.txt
+PySide6>=6.5

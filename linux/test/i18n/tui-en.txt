@@ -1,0 +1,85 @@
+
+
+  diskinfer 1.1-preview  ·  loading model                                       
+
+  /mnt/d/LMStudioModel/bayliner1980/Qwen3.5-0.8B-MoE-A0.6B-GGUF/Qwen3.5-0.8B-M
+
+  registering weights, allocating the disk arena ...
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  this can take a few seconds
+  diskinfer 1.1-preview  ·  disk streaming TUI                                  
+  model   Qwen3.5-0.8B-MoE-A0.6B-Q4_K_M.gguf
+  ctx max 262144 layers 24   arena 222.9 MiB
+  stream  514.0 MiB on disk, 440 tensors, direct io on
+
+ ── Settings ──────────────────────────────────────────────────────────────────
+
+  ▸ Context length      16          3 .. 262144   <- -> adjust, or type a number
+    Temperature         0.70        0.00 .. 1.00   step 0.05
+    Chat template       off         ctx becomes 16 + 12 template tokens
+    MoE fast path       off         only router selected experts are read (reloa
+    API server          off         http://127.0.0.1:4000/v1  (no key)
+
+ ── Status ────────────────────────────────────────────────────────────────────
+  ready
+  system prompt: (none)
+ ── Log ───────────────────────────────────────────────────────────────────────
+  largest tensor), direct io = 1, mlock = 0, prefetch = 0 (lookahead 16)
+  
+  [load] model ready in 0.6s: qwen35moe ?B Q4_K - Medium
+  [load] n_ctx_train 262144  n_layer 24  vocab 248320  arena 222.9 MiB  direct
+  -io 1  streaming on
+
+  ↑↓ select   ←→ adjust   Enter toggle   s start   c back   q quit
+  diskinfer 1.1-preview  ·  run                                                 
+  Qwen3.5-0.8B-MoE-A0.6B-Q4_K_M.gguf
+  ctx 16  temp 0.70  raw  MoE off  API off
+ ── Prompt ────────────────────────────────────────────────────────────────────
+  > Hello
+ ── Progress ──────────────────────────────────────────────────────────────────
+  prefill  -
+  generate -
+  disk  514.0 MiB streamed on disk, 440 tensors
+  TUI inference running ...
+ ── Model ─────────────────────────────────────────────────────────────────────
+    model    Qwen3.5-0.8B-MoE-A0.6B-Q4_K_M.gguf
+    path     /mnt/d/LMStudioModel/bayliner1980/Qwen3.5-0.8B-MoE-A0.6B-GGUF/Qwen
+    size     514.0 MiB on disk, 440 tensors registered
+    arena    222.9 MiB   direct io on   mlock on
+    context  set 16   max 262144   template +12 tok
+    runtime  4 threads   ubatch 4   max tokens 256
+ ── Log ───────────────────────────────────────────────────────────────────────
+  [load] n_ctx_train 262144  n_layer 24  vocab 248320  arena 222.9 MiB  direct
+  -io 1  streaming on
+
+
+
+  s start   c cancel   q quit   i edit prompt                                  
+  prefill  [██████████████████████] 1/1 tok   io 0.0s  cmp 0.0s
+  generate 0 tok   0.00 tok/s
+  disk  0 B read  0 loads  0 evict  io 0.0s cmp 0.0s
+ ── Answer ────────────────────────────────────────────────────────────────────
+  
+  
+  
+  
+  
+  
+  -io 1  streaming on
+  [warn] ctx 16 leaves room for 15 generated tokens

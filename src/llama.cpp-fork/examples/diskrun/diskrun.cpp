@@ -9,10 +9,13 @@
 #endif
 #endif
 
+#include <algorithm>
+
 #include "llama.h"
 #include "ggml-cpu.h"
 
 #include <clocale>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -69,6 +72,7 @@ int main(int argc, char ** argv) {
     int n_ubatch           = 1;
     int n_threads          = 4;
     int ngl                = 0;
+    bool extra_bufts       = true;   // repack bufts (off in disk-streaming mode)
 
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -85,6 +89,10 @@ int main(int argc, char ** argv) {
         else if (a == "-ub")      { n_ubatch  = next(n_ubatch); }
         else if (a == "-t")       { n_threads = next(n_threads); }
         else if (a == "-ngl")     { ngl       = next(ngl); }
+        // native comparison on the desktop: the disk-streaming load path disables the extra
+        // (repack) buffer types, so the non-streaming baseline has to be taken with them
+        // disabled as well for a fair greedy token comparison
+        else if (a == "-no-extra-bufts" || a == "--no-extra-bufts") { extra_bufts = false; }
         else if (a == "-p")       { if (i + 1 < argc) prompt = argv[++i]; }
         else if (a == "--prompt-tokens") {
             // remaining args are token ids
@@ -111,7 +119,7 @@ int main(int argc, char ** argv) {
     }
 
     if (model_path.empty()) {
-        fprintf(stderr, "usage: %s -m model.gguf [-n n_predict] [-c n_ctx] [-b n_batch] [-ub n_ubatch] [-t threads] [prompt]\n", argv[0]);
+        fprintf(stderr, "usage: %s -m model.gguf [-n n_predict] [-c n_ctx] [-b n_batch] [-ub n_ubatch] [-t threads] [-ngl n_gpu_layers] [-no-extra-bufts] [prompt]\n", argv[0]);
         return 1;
     }
 
@@ -124,6 +132,12 @@ int main(int argc, char ** argv) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = ngl;
+    // The disk-streaming load path disables the extra buffer types (weight
+    // repacking: Q4_K/Q8_0 tensors get a platform-specific 8x4/16x1 layout),
+    // so the native mmap path can be run with the same layout via
+    // -no-extra-bufts for a fair greedy token comparison. The default keeps
+    // upstream behaviour (extra bufts enabled).
+    mparams.use_extra_bufts = extra_bufts;
 
     const int64_t t_load = ggml_time_us();
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
@@ -131,7 +145,13 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "diskrun: failed to load model\n");
         return 1;
     }
-    fprintf(stderr, "diskrun: model loaded in %.1f s\n", (ggml_time_us() - t_load) / 1e6);
+    // the loader disables the extra buffer types (weight repacking) whenever the
+    // disk-streaming path is active, so report the effective state as well
+    const char * env_stream = getenv("LLAMA_DISK_STREAM_MB");
+    const bool disk_stream_mode = env_stream == nullptr || atoi(env_stream) > 0;
+    const bool repack_active = extra_bufts && !disk_stream_mode;
+    fprintf(stderr, "diskrun: model loaded in %.1f s (extra bufts requested = %d, repack active = %d)\n",
+            (ggml_time_us() - t_load) / 1e6, extra_bufts ? 1 : 0, repack_active ? 1 : 0);
     print_rss("after model load");
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -180,15 +200,66 @@ int main(int argc, char ** argv) {
         return llama_decode(ctx, batch) == 0;
     };
 
+    // debugging: fingerprint the logits after every decode to compare window modes
+    const bool logit_hash = getenv("LLAMA_DISK_LOGIT_HASH") != nullptr &&
+                            atoi(getenv("LLAMA_DISK_LOGIT_HASH")) == 1;
+    auto hash_logits = [&](const char * tag, int step) {
+        if (!logit_hash) {
+            return;
+        }
+        const float * lg = llama_get_logits_ith(ctx, -1);
+        if (lg == nullptr) {
+            fprintf(stderr, "dbg: logits %s step=%d null\n", tag, step);
+            return;
+        }
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+        uint64_t h = 1469598103934665603ull;
+        double   sum = 0.0;
+        int      top = 0;
+        float    topv = -INFINITY;
+        for (int i = 0; i < n_vocab; ++i) {
+            const uint32_t bits = (uint32_t) (int32_t) llroundf(lg[i] * 1000.0f);
+            h = (h ^ bits) * 1099511628211ull;
+            sum += lg[i];
+            if (lg[i] > topv) {
+                topv = lg[i];
+                top  = i;
+            }
+        }
+        fprintf(stderr, "dbg: logits %s step=%d n=%d h=%016llx sum=%.6f top=%d topv=%.6f\n",
+                tag, step, n_vocab, (unsigned long long) h, sum, top, topv);
+    };
+
     int n_pos = 0;
     const int64_t t_prefill = ggml_time_us();
-    for (int i = 0; i < n_prompt; ++i) {
-        if (!decode_one(tokens[i], n_pos++, i == n_prompt - 1)) {
-            fprintf(stderr, "diskrun: prefill failed at %d\n", i);
-            return 1;
+    const char * env_pb = getenv("LLAMA_PREFILL_BATCH");
+    const int prefill_batch = env_pb != nullptr ? std::max(1, atoi(env_pb)) : 1;
+    for (int i = 0; i < n_prompt; ) {
+        const int m = std::min(prefill_batch, n_prompt - i);
+        if (m == 1) {
+            if (!decode_one(tokens[i], n_pos++, i == n_prompt - 1)) {
+                fprintf(stderr, "diskrun: prefill failed at %d\n", i);
+                return 1;
+            }
+        } else {
+            batch.n_tokens = m;
+            for (int j = 0; j < m; ++j) {
+                const int k = i + j;
+                batch.token[j]     = tokens[k];
+                batch.pos[j]       = n_pos++;
+                batch.n_seq_id[j]  = 1;
+                batch.seq_id[j][0] = 0;
+                batch.logits[j]    = (k == n_prompt - 1);
+            }
+            if (llama_decode(ctx, batch) != 0) {
+                fprintf(stderr, "diskrun: prefill batch failed at %d\n", i);
+                return 1;
+            }
         }
-        fprintf(stderr, "diskrun: prefill token %d/%d done, rss = %ld MiB\n", i + 1, n_prompt, rss_kb() / 1024);
+        i += m;
+        fprintf(stderr, "diskrun: prefill token %d/%d done, rss = %ld MiB\n", i, n_prompt, rss_kb() / 1024);
     }
+    hash_logits("prefill", n_prompt - 1);
     fprintf(stderr, "diskrun: prefill took %.1f s\n", (ggml_time_us() - t_prefill) / 1e6);
     print_rss("after prefill");
 
@@ -221,6 +292,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
+        hash_logits("gen", n_gen);
         fprintf(stderr, "\ndiskrun: token %d id=%d sample=%.3f s, rss = %ld MiB\n",
                 n_gen, cur, (ggml_time_us() - t0) / 1e6, rss_kb() / 1024);
     }
